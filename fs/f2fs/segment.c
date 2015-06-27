@@ -134,6 +134,14 @@ static inline unsigned long __reverse_ffs(unsigned long word)
 static unsigned long __find_rev_next_bit(const unsigned long *addr,
 			unsigned long size, unsigned long offset)
 {
+	while (!f2fs_test_bit(offset, (unsigned char *)addr))
+		offset++;
+
+	if (offset > size)
+		offset = size;
+
+	return offset;
+#if 0
 	const unsigned long *p = addr + BIT_WORD(offset);
 	unsigned long result = offset & ~(BITS_PER_LONG - 1);
 	unsigned long tmp;
@@ -180,11 +188,20 @@ found_first:
 		return result + size;   /* Nope. */
 found_middle:
 	return result + __reverse_ffs(tmp);
+#endif
 }
 
 static unsigned long __find_rev_next_zero_bit(const unsigned long *addr,
 			unsigned long size, unsigned long offset)
 {
+	while (f2fs_test_bit(offset, (unsigned char *)addr))
+		offset++;
+
+	if (offset > size)
+		offset = size;
+
+	return offset;
+#if 0
 	const unsigned long *p = addr + BIT_WORD(offset);
 	unsigned long result = offset & ~(BITS_PER_LONG - 1);
 	unsigned long tmp;
@@ -232,6 +249,7 @@ found_first:
 		return result + size;   /* Nope. */
 found_middle:
 	return result + __reverse_ffz(tmp);
+#endif
 }
 
 void register_inmem_page(struct inode *inode, struct page *page)
@@ -560,7 +578,20 @@ static int f2fs_issue_discard(struct f2fs_sb_info *sbi,
 
 void discard_next_dnode(struct f2fs_sb_info *sbi, block_t blkaddr)
 {
-	if (f2fs_issue_discard(sbi, blkaddr, 1)) {
+	int err = -ENOTSUPP;
+
+	if (test_opt(sbi, DISCARD)) {
+		struct seg_entry *se = get_seg_entry(sbi,
+				GET_SEGNO(sbi, blkaddr));
+		unsigned int offset = GET_BLKOFF_FROM_SEG0(sbi, blkaddr);
+
+		if (f2fs_test_bit(offset, se->discard_map))
+			return;
+
+		err = f2fs_issue_discard(sbi, blkaddr, 1);
+	}
+
+	if (err) {
 		struct page *page = grab_meta_page(sbi, blkaddr);
 		/* zero-filled page */
 		set_page_dirty(page);
@@ -1365,32 +1396,41 @@ void rewrite_data_page(struct f2fs_io_info *fio)
 	f2fs_submit_page_mbio(fio);
 }
 
-void recover_data_page(struct f2fs_sb_info *sbi,
-			struct page *page, struct f2fs_summary *sum,
-			block_t old_blkaddr, block_t new_blkaddr)
+void f2fs_replace_block(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
+				block_t old_blkaddr, block_t new_blkaddr,
+				bool recover_curseg)
 {
 	struct sit_info *sit_i = SIT_I(sbi);
 	struct curseg_info *curseg;
 	unsigned int segno, old_cursegno;
 	struct seg_entry *se;
 	int type;
+	unsigned short old_blkoff;
 
 	segno = GET_SEGNO(sbi, new_blkaddr);
 	se = get_seg_entry(sbi, segno);
 	type = se->type;
 
-	if (se->valid_blocks == 0 && !IS_CURSEG(sbi, segno)) {
-		if (old_blkaddr == NULL_ADDR)
-			type = CURSEG_COLD_DATA;
-		else
+	if (!recover_curseg) {
+		/* for recovery flow */
+		if (se->valid_blocks == 0 && !IS_CURSEG(sbi, segno)) {
+			if (old_blkaddr == NULL_ADDR)
+				type = CURSEG_COLD_DATA;
+			else
+				type = CURSEG_WARM_DATA;
+		}
+	} else {
+		if (!IS_CURSEG(sbi, segno))
 			type = CURSEG_WARM_DATA;
 	}
+
 	curseg = CURSEG_I(sbi, type);
 
 	mutex_lock(&curseg->curseg_mutex);
 	mutex_lock(&sit_i->sentry_lock);
 
 	old_cursegno = curseg->segno;
+	old_blkoff = curseg->next_blkoff;
 
 	/* change the current segment */
 	if (segno != curseg->segno) {
@@ -1403,6 +1443,14 @@ void recover_data_page(struct f2fs_sb_info *sbi,
 
 	refresh_sit_entry(sbi, old_blkaddr, new_blkaddr);
 	locate_dirty_segment(sbi, old_cursegno);
+
+	if (recover_curseg) {
+		if (old_cursegno != curseg->segno) {
+			curseg->next_segno = old_cursegno;
+			change_curseg(sbi, type, true);
+		}
+		curseg->next_blkoff = old_blkoff;
+	}
 
 	mutex_unlock(&sit_i->sentry_lock);
 	mutex_unlock(&curseg->curseg_mutex);
